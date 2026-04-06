@@ -31,5 +31,5 @@ class AtomObservation(Observation):
     step_number: int = Field(..., description="Current step within episode")
     max_steps: int = Field(..., description="Maximum steps allowed")
     done: bool = Field(..., description="Whether the episode is done")
-    trajectory_summary: Dict[str, Any] = Field(..., description="Running statistics about optimization trajectory")
+    trajectory_summary: Optional[Dict[str, Any]] = Field(None, description="Running statistics about optimization trajectory")
     reward: float = Field(..., description="Reward for the current step/trajectory")

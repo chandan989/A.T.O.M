@@ -99,6 +99,7 @@ class AtomEnvironment(Environment):
         )
 
     def step(self, action: AtomAction) -> AtomObservation:
+      try:
         # Robust parsing to handle openenv base Action wrapping
         if not isinstance(action, AtomAction):
             if hasattr(action, 'model_dump'):
@@ -152,7 +153,7 @@ class AtomEnvironment(Environment):
 
         elif action.action_type == "add_fragment":
             if action.fragment_name not in FRAGMENTS:
-                message = f"Invalid action: Fragment {action.fragment_name} not found in library."
+                message = f"Invalid action: Fragment '{action.fragment_name}' not found in library. Available: {', '.join(FRAGMENTS.keys())}"
                 self.tracker.add_step(action.model_dump(), self.current_properties, False)
             else:
                 fragment_smiles = FRAGMENTS[action.fragment_name].smiles
@@ -240,6 +241,21 @@ class AtomEnvironment(Environment):
             done=done,
             trajectory_summary=self.tracker.get_summary(),
             reward=reward
+        )
+      except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return AtomObservation(
+            current_smiles=self.current_smiles or "",
+            current_properties=self.current_properties or {},
+            target_profile=self.task.tpp if hasattr(self, 'task') and self.task else {},
+            message=f"INTERNAL ERROR: {str(e)}",
+            valid_sites=None,
+            step_number=getattr(self._state, 'step_count', 0),
+            max_steps=self.task.max_steps if hasattr(self, 'task') and self.task else 0,
+            done=True,
+            trajectory_summary=None,
+            reward=0.0
         )
 
     @property

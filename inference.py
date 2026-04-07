@@ -1,108 +1,148 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-
 """
-Baseline inference script for ATOM Environment.
-Runs a Dual-Agent (Generator + Critic) loop.
+A.T.O.M. — Agentic Trajectories for Optimizing Molecules
+Baseline Inference Script
+
+Structured stdout logs follow [START], [STEP], [END] format for automated evaluation.
+Uses OpenAI Client for all LLM calls as required.
 """
 
 import os
 import json
-import time
-from typing import Dict, Any, List
-
+import re
+import httpx
+from typing import Dict, Any, List, Optional
 from openai import OpenAI
 
-# We mock EnvClient by importing the generated client or manually creating a thin wrapper.
-# OpenEnv client expects standard http/ws calls to reset/step endpoints.
-import httpx
+
+# ══════════════════════════════════════════════════════════════
+#  ENVIRONMENT CLIENT
+# ══════════════════════════════════════════════════════════════
 
 class SimpleAtomClient:
-    def __init__(self, base_url: str, api_key: str = ""):
-        self.base_url = base_url
-        self.headers = {}
-        if api_key:
-            self.headers["Authorization"] = f"Bearer {api_key}"
+    def __init__(self, base_url: str, api_key: str):
+        self.base_url = base_url.rstrip("/")
+        self.headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
 
-    def reset(self, task_id: int):
-        resp = httpx.post(f"{self.base_url}/env/reset", params={"task_id": task_id}, headers=self.headers)
+    def reset(self, task_id: int = 1):
+        resp = httpx.post(
+            f"{self.base_url}/env/reset",
+            params={"task_id": task_id},
+            headers=self.headers,
+            timeout=30,
+        )
         resp.raise_for_status()
         return resp.json()
 
     def step(self, action: Dict[str, Any]):
-        resp = httpx.post(f"{self.base_url}/env/step", json={"action": action}, headers=self.headers)
+        resp = httpx.post(
+            f"{self.base_url}/env/step",
+            json={"action": action},
+            headers=self.headers,
+            timeout=30,
+        )
         resp.raise_for_status()
         return resp.json()
 
+
+# ══════════════════════════════════════════════════════════════
+#  ACTION PARSING (robust JSON extraction for verbose LLMs)
+# ══════════════════════════════════════════════════════════════
+
 def parse_action(response_text: str) -> Dict[str, Any]:
-    import re
     try:
-        # Try structured ```json blocks first
         if "```json" in response_text:
             json_str = response_text.split("```json")[1].split("```")[0]
             return json.loads(json_str)
-        
-        # Try to find any JSON object with action_type in the response
-        # This handles verbose models that write explanations around the JSON
+
         matches = re.findall(r'\{[^{}]*"action_type"[^{}]*\}', response_text)
         if matches:
-            return json.loads(matches[-1])  # Use the last match (usually the final answer)
-        
-        # Last resort: try parsing the whole thing
+            return json.loads(matches[-1])
+
         return json.loads(response_text)
-    except Exception as e:
-        print(f"Error parsing action: {e}. Text: {response_text[:200]}...")
+    except Exception:
         return {"action_type": "get_valid_sites"}
 
-def run_task(client: SimpleAtomClient, llm: OpenAI, model_name: str, task_id: int):
-    print(f"\n--- Starting Task {task_id} ---")
 
+# ══════════════════════════════════════════════════════════════
+#  SINGLE TASK RUNNER
+# ══════════════════════════════════════════════════════════════
+
+def run_task(
+    client: SimpleAtomClient,
+    llm: OpenAI,
+    model_name: str,
+    task_id: int,
+) -> float:
+    # ── Reset environment ─────────────────────────────────────
     obs = client.reset(task_id=task_id)
     observation = obs["observation"]
-
     max_steps = observation["max_steps"]
 
+    # Structured log: [START]
+    print(json.dumps({
+        "event": "[START]",
+        "task_id": task_id,
+        "max_steps": max_steps,
+        "starting_smiles": observation["current_smiles"],
+        "target_profile": observation["target_profile"],
+    }))
+
+    valid_sites_cache: Optional[List] = None
+
     for step in range(max_steps):
-        # 1. Generator Proposes Action
-        prompt = f"""You are an expert medicinal chemist optimizing a molecule to match a Target Product Profile (TPP).
+        # Track valid sites across steps
+        if observation.get("valid_sites"):
+            valid_sites_cache = observation["valid_sites"]
+
+        # ── Build prompt ──────────────────────────────────────
+        if valid_sites_cache:
+            prompt = f"""You are an expert medicinal chemist. You MUST now add a fragment to optimize this molecule.
 
 Current SMILES: {observation['current_smiles']}
 Current Properties: {json.dumps(observation['current_properties'], indent=2)}
 Target Profile (TPP): {json.dumps(observation['target_profile'], indent=2)}
-Previous feedback: {observation['message']}
 Step: {step+1}/{max_steps}
 
-RULES:
-- You MUST call "get_valid_sites" FIRST before any "add_fragment" action. This returns the valid site_id values.
-- Only use "add_fragment" AFTER you have received valid_sites from a previous step.
-- Use "finish" when you believe the TPP is satisfied or you cannot improve further.
+You ALREADY have valid sites. You MUST use "add_fragment" now. Do NOT call "get_valid_sites" again.
+Pick the best fragment and site to move properties closer to the TPP ranges.
 
-Available fragment names (use EXACTLY these names, case-sensitive):
-Halogens: Fluorine, Chlorine, Bromine, Trifluoromethyl, Trifluoromethoxy
-Polar: Hydroxyl, Amino, Methylamino, Dimethylamino, Carboxyl, Methoxy, Ethoxy, Cyano, Nitro
-Carbonyl: Formyl, Acetyl, Amide, Sulfonamide, Methylsulfonyl
-Aliphatic: Methyl, Ethyl, Propyl, Isopropyl, tert-Butyl, Cyclopropyl
-Aromatic: Phenyl, Pyridine, Thiophene, Imidazole, Pyrazole, Triazole
+Valid Sites:
+{json.dumps(valid_sites_cache, indent=2)}
 
-Respond with ONLY a JSON object, no explanation:
-{{"action_type": "get_valid_sites"}}
-or {{"action_type": "add_fragment", "fragment_name": "Methyl", "site_id": 0}}
+Available fragments (case-sensitive):
+- To INCREASE LogP: Methyl, Ethyl, Propyl, Isopropyl, tert-Butyl, Phenyl, Trifluoromethyl, Chlorine, Fluorine
+- To DECREASE LogP: Hydroxyl, Amino, Carboxyl, Cyano, Amide, Morpholine
+- To INCREASE MW: Phenyl, Cyclohexyl, Naphthalene, Indole, Piperidine
+- To fine-tune: Methoxy, Cyclopropyl, Pyridine, Thiophene, Acetyl
+
+Respond with ONLY JSON, no explanation:
+{{"action_type": "add_fragment", "fragment_name": "Methyl", "site_id": 0}}
 or {{"action_type": "finish"}}"""
+        else:
+            prompt = f"""You are an expert medicinal chemist. Get the valid attachment sites first.
 
-        # Give context of valid sites if available
-        if observation.get("valid_sites"):
-            prompt += f"\n\nValid Sites (use these site_id values):\n{json.dumps(observation['valid_sites'], indent=2)}"
+Current SMILES: {observation['current_smiles']}
+Current Properties: {json.dumps(observation['current_properties'], indent=2)}
+Target Profile (TPP): {json.dumps(observation['target_profile'], indent=2)}
 
-        generator_resp = llm.chat.completions.create(
-            model=model_name,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1
-        )
+Respond with ONLY JSON:
+{{"action_type": "get_valid_sites"}}"""
 
-        proposed_action = parse_action(generator_resp.choices[0].message.content)
-        print(f"Step {step+1}: Proposed Action: {proposed_action}")
+        # ── Generator LLM call ────────────────────────────────
+        try:
+            generator_resp = llm.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+            )
+            proposed_action = parse_action(generator_resp.choices[0].message.content)
+        except Exception as e:
+            proposed_action = {"action_type": "finish"}
 
-        # 2. Critic — SKIP for reconnaissance/finish actions, only critique modifications
+        # ── Critic (only for add_fragment) ────────────────────
         if proposed_action.get("action_type") in ("get_valid_sites", "finish"):
             final_action = proposed_action
         else:
@@ -122,80 +162,140 @@ RULES:
 Respond with ONLY a JSON object:
 {{"action_type": "add_fragment", "fragment_name": "FragmentName", "site_id": 0}}"""
 
-            critic_resp = llm.chat.completions.create(
-                model=model_name,
-                messages=[{"role": "user", "content": critic_prompt}],
-                temperature=0.1
-            )
-            final_action = parse_action(critic_resp.choices[0].message.content)
+            try:
+                critic_resp = llm.chat.completions.create(
+                    model=model_name,
+                    messages=[{"role": "user", "content": critic_prompt}],
+                    temperature=0.1,
+                )
+                final_action = parse_action(critic_resp.choices[0].message.content)
+            except Exception:
+                final_action = proposed_action
 
-        print(f"Step {step+1}: Final Action: {final_action}")
+        # ── Sanitize action ───────────────────────────────────
+        clean_action = {"action_type": final_action.get("action_type", "get_valid_sites")}
+        if clean_action["action_type"] == "add_fragment":
+            clean_action["fragment_name"] = final_action.get("fragment_name", "Methyl")
+            clean_action["site_id"] = final_action.get("site_id", 0)
 
-        # 3. Execute Action
-        result = client.step(final_action)
-        observation = result["observation"]
+        # ── Execute action ────────────────────────────────────
+        result = client.step(clean_action)
+        if "error" in result:
+            # Structured log: [STEP] with error
+            print(json.dumps({
+                "event": "[STEP]",
+                "task_id": task_id,
+                "step": step + 1,
+                "action": clean_action,
+                "error": result["error"],
+                "reward": 0.0,
+            }))
+            continue
 
-        if result.get("done", False) or result.get("observation", {}).get("done", False):
-            reward = result.get("reward", 0.0)
-            print(f"Task finished. Final Score: {reward}")
+        observation = result.get("observation", observation)
+        reward = result.get("reward", 0.0)
+        done = result.get("done", False)
+
+        # Structured log: [STEP]
+        print(json.dumps({
+            "event": "[STEP]",
+            "task_id": task_id,
+            "step": step + 1,
+            "action": clean_action,
+            "smiles": observation.get("current_smiles", ""),
+            "properties": observation.get("current_properties", {}),
+            "message": observation.get("message", ""),
+            "reward": reward,
+            "done": done,
+        }))
+
+        if done:
+            # Structured log: [END]
+            print(json.dumps({
+                "event": "[END]",
+                "task_id": task_id,
+                "final_smiles": observation.get("current_smiles", ""),
+                "final_properties": observation.get("current_properties", {}),
+                "final_score": reward,
+                "steps_taken": step + 1,
+            }))
             return reward
 
-    # Auto-finish if max steps reached without agent calling finish
+    # Auto-finish if max steps reached
     result = client.step({"action_type": "finish"})
     reward = result.get("reward", 0.0)
-    print(f"Task max steps reached. Final Score: {reward}")
+
+    # Structured log: [END]
+    print(json.dumps({
+        "event": "[END]",
+        "task_id": task_id,
+        "final_smiles": result.get("observation", {}).get("current_smiles", ""),
+        "final_properties": result.get("observation", {}).get("current_properties", {}),
+        "final_score": reward,
+        "steps_taken": max_steps,
+    }))
     return reward
 
-def main():
-    # ==============================================================
-    # CONFIGURATION: Paste your keys between the quotes below!
-    # ==============================================================
-    
-    # 1. Your Hugging Face Token (starts with hf_...)
-    api_key = os.environ.get("HF_TOKEN", "")
-    
-    # 2. Your ATOM Server Key (from the Hugging Face Logs)
-    atom_api_key = os.environ.get("ATOM_API_KEY", "d66af663a5b7f8282317329035869279c83deacc9188ee909d439a3c28b550aa")
-    
-    # 3. Your Space URL (No trailing slash)
-    atom_server_url = os.environ.get("ATOM_SERVER_URL", "https://nikhhil07-atom-env.hf.space")
 
-    # ==============================================================
-    
+# ══════════════════════════════════════════════════════════════
+#  MAIN — Configurable via environment variables
+# ══════════════════════════════════════════════════════════════
+
+def main():
+    # Required environment variables (per hackathon spec)
+    api_key = os.environ.get("HF_TOKEN", "")
     base_url = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1/")
-    model_name = os.environ.get("MODEL_NAME", "meta-llama/Llama-4-Scout-17B-16E-Instruct")
+    model_name = os.environ.get("MODEL_NAME", "meta-llama/Llama-3.3-70B-Instruct")
+
+    # ATOM Server configuration
+    atom_api_key = os.environ.get("ATOM_API_KEY", "")
+    atom_server_url = os.environ.get("ATOM_SERVER_URL", "https://nikhhil07-atom-env.hf.space")
 
     print(f"Using Model: {model_name}")
     print(f"Using API Base: {base_url}")
     print(f"Using ATOM Server: {atom_server_url}")
 
-    # We will use the OpenAI client
-    llm = OpenAI(api_key=api_key, base_url=base_url)
+    # Initialize OpenAI client pointing to HF Router
+    llm = OpenAI(base_url=base_url, api_key=api_key)
 
-    # Connect to ATOM server with API key auth
-    client = SimpleAtomClient(atom_server_url, api_key=atom_api_key)
+    # Initialize ATOM environment client
+    client = SimpleAtomClient(atom_server_url, atom_api_key)
 
-    # Check if server is up
-    try:
-        httpx.get(f"{atom_server_url}/health")
-    except Exception:
-        print("Server not running. Start it with `python server/app.py`")
-        return
-
+    # Verify connection
     if atom_api_key:
-        print("API key configured. Authenticating...")
-    else:
-        print("WARNING: No ATOM_API_KEY set. Requests may be rejected by the server.")
+        try:
+            resp = httpx.get(
+                f"{atom_server_url}/auth/verify",
+                headers={"Authorization": f"Bearer {atom_api_key}"},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                print("API key configured. Authenticating... OK")
+            else:
+                print(f"WARNING: Auth verification returned {resp.status_code}")
+        except Exception as e:
+            print(f"WARNING: Could not verify auth: {e}")
 
+    # Run all 4 tasks
     scores = {}
-
     for task_id in [1, 2, 3, 4]:
-        score = run_task(client, llm, model_name, task_id)
-        scores[f"Task {task_id}"] = score
+        try:
+            score = run_task(client, llm, model_name, task_id)
+            scores[task_id] = score
+        except Exception as e:
+            print(json.dumps({
+                "event": "[END]",
+                "task_id": task_id,
+                "error": str(e),
+                "final_score": 0.0,
+            }))
+            scores[task_id] = 0.0
 
+    # Final summary
     print("\n=== Final Scores ===")
-    for task, score in scores.items():
-        print(f"{task}: {score:.4f}")
+    for tid, score in scores.items():
+        print(f"Task {tid}: {score:.4f}")
+
 
 if __name__ == "__main__":
     main()

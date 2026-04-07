@@ -317,6 +317,18 @@ async def env_step(request: Request):
     return result
 
 
+@app.get("/env/state")
+async def env_state():
+    """Return current environment state (OpenEnv spec compliance)."""
+    env = env_manager.get_or_create()
+    state = env.state
+    return {
+        "step_count": getattr(state, 'step_count', 0),
+        "task_id": getattr(state, 'task_id', 1),
+        "done": getattr(state, 'done', False),
+    }
+
+
 # ── Mount the openenv app at /env/openenv (for schema/ws/etc) ─
 app.mount("/env/openenv", openenv_app)
 

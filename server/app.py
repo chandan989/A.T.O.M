@@ -275,26 +275,72 @@ class EnvManager:
 env_manager = EnvManager()
 
 
-@app.post("/env/reset")
-async def env_reset(task_id: int = 1):
-    """Reset the environment with a new task. Returns initial observation."""
-    env = env_manager.reset_env(task_id)
-    obs = env.reset(task_id=task_id)
+async def _read_json_body(request: Request) -> Dict[str, Any]:
+    """Parse a JSON body when present and tolerate empty or invalid bodies."""
+    body = await request.body()
+    if not body:
+        return {}
 
-    result = {
-        "observation": obs.model_dump() if hasattr(obs, 'model_dump') else obs.__dict__,
-        "reward": 0.0,
-        "done": False,
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        return {}
+
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _build_reset_result(obs: AtomObservation) -> Dict[str, Any]:
+    return {
+        "observation": obs.model_dump() if hasattr(obs, "model_dump") else obs.__dict__,
+        "reward": getattr(obs, "reward", 0.0),
+        "done": getattr(obs, "done", False),
     }
+
+
+def _build_state_result(env: AtomEnvironment) -> Dict[str, Any]:
+    state = env.state
+    state_payload = state.model_dump() if hasattr(state, "model_dump") else dict(state.__dict__)
+    state_payload.setdefault("task_id", getattr(env, "task_id", 1))
+    state_payload.setdefault("done", False)
+    return state_payload
+
+
+async def _handle_reset(request: Request, task_id: Optional[int] = None) -> Dict[str, Any]:
+    """Reset the environment with either query params or a JSON payload."""
+    payload = await _read_json_body(request)
+
+    resolved_task_id = payload.get("task_id", task_id)
+    custom_tpp = payload.get("custom_tpp")
+    custom_scaffold = payload.get("custom_scaffold")
+    max_steps = payload.get("max_steps")
+
+    env = env_manager.reset_env(resolved_task_id or 1)
+    obs = env.reset(
+        task_id=resolved_task_id,
+        custom_tpp=custom_tpp,
+        custom_scaffold=custom_scaffold,
+        max_steps=max_steps,
+    )
+
+    result = _build_reset_result(obs)
 
     await observer_manager.broadcast({"type": "reset", "data": result})
     return result
 
 
-@app.post("/env/step")
-async def env_step(request: Request):
+@app.post("/env/reset")
+async def env_reset(request: Request, task_id: Optional[int] = None):
+    return await _handle_reset(request, task_id)
+
+
+@app.post("/reset")
+async def reset(request: Request, task_id: Optional[int] = None):
+    return await _handle_reset(request, task_id)
+
+
+async def _handle_step(request: Request) -> Dict[str, Any]:
     """Execute an action on the current environment. Returns observation."""
-    body = await request.json()
+    body = await _read_json_body(request)
     action_data = body.get("action", body)
 
     env = env_manager.get_or_create()
@@ -305,11 +351,11 @@ async def env_step(request: Request):
         return {"error": f"Invalid action: {str(e)}"}
 
     obs = env.step(action)
-    done = getattr(obs, 'done', False)
-    reward = getattr(obs, 'reward', 0.0)
+    done = getattr(obs, "done", False)
+    reward = getattr(obs, "reward", 0.0)
 
     result = {
-        "observation": obs.model_dump() if hasattr(obs, 'model_dump') else obs.__dict__,
+        "observation": obs.model_dump() if hasattr(obs, "model_dump") else obs.__dict__,
         "reward": reward,
         "done": done,
     }
@@ -318,16 +364,27 @@ async def env_step(request: Request):
     return result
 
 
+@app.post("/env/step")
+async def env_step(request: Request):
+    return await _handle_step(request)
+
+
+@app.post("/step")
+async def step(request: Request):
+    return await _handle_step(request)
+
+
 @app.get("/env/state")
 async def env_state():
     """Return current environment state (OpenEnv spec compliance)."""
     env = env_manager.get_or_create()
-    state = env.state
-    return {
-        "step_count": getattr(state, 'step_count', 0),
-        "task_id": getattr(state, 'task_id', 1),
-        "done": getattr(state, 'done', False),
-    }
+    return _build_state_result(env)
+
+
+@app.get("/state")
+async def state():
+    env = env_manager.get_or_create()
+    return _build_state_result(env)
 
 
 # ── Mount the openenv app at /env/openenv (for schema/ws/etc) ─
